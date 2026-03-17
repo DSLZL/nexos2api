@@ -3,3 +3,8 @@ node_modules/
 *.log
 .DS_Store
 current-chat.json
+__pycache__/
+.claude/
+.serena/
+.spec-workflow/
+CLAUDE.md
