@@ -1,4 +1,5 @@
 """POST /v1/chat/completions — OpenAI 兼容接口。"""
+import asyncio
 import json
 import os
 import time
@@ -10,17 +11,23 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.chat_store import create_new_chat
 from app.config import BASE_URL
-from app.cookie_pool import clear_chat_id, get_next_with_chat, set_chat_id
+from app.cookie_pool import clear_chat_id, get_chat_id, get_next_with_chat, set_chat_id
 from app.nexos_client import (
     build_headers,
     build_nexos_payload,
     generate_message_id,
+    init_chat_on_server,
     make_client,
     replace_image_links,
     resolve_handler_id,
 )
 
 router = APIRouter()
+
+# per-cookie 独立锁：仅用于首次 chat_id 创建，防并发重复获取
+_chat_init_locks: dict[str, asyncio.Lock] = {}
+# 正在处理请求的 cookie 集合（cookie 前 32 字符为键）
+_busy_cookies: set[str] = set()
 
 
 class _ChatNotFoundError(Exception):
@@ -290,16 +297,42 @@ async def chat_completions(request: Request):
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+    # P4：若选中的 cookie 正在处理请求，说明所有 cookie 均繁忙，直接拒绝
+    cookie_key = cookies[:32]
+    if cookie_key in _busy_cookies:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "所有 Cookie 均繁忙，请稍后重试"},
+            headers={"Retry-After": "5"},
+        )
+    _busy_cookies.add(cookie_key)
+
+    # 确保设置阶段异常时也释放 busy 标记（流式/非流式路径各自的 finally 负责正常路径）
     async def _get_chat() -> tuple[str, str | None, bool]:
-        """优先复用绑定的 chat_id，否则创建新 chat。"""
+        """优先复用绑定的 chat_id；否则加 per-cookie 锁创建，防并发重复获取。"""
         if bound_chat_id:
             print(f"Reusing bound chat_id: {bound_chat_id}")
-            return bound_chat_id, None, True
-        cid, last_msg, is_real = await create_new_chat(cookies)
-        if cid and is_real:
-            set_chat_id(cookies, cid)
-        print(f"New chat created: {cid}, last_message_id: {last_msg}, is_real: {is_real}")
-        return cid, last_msg, is_real
+            # 刷新 last_message_id，避免 parent_id isn't of latest message 错误
+            async with make_client(timeout=30) as _c:
+                fresh_last_msg = await init_chat_on_server(_c, bound_chat_id, cookies)
+            return bound_chat_id, fresh_last_msg, True
+        # 用 cookie 前 32 字符作为锁键，防止并发请求重复创建 chat
+        lock_key = cookies[:32]
+        if lock_key not in _chat_init_locks:
+            _chat_init_locks[lock_key] = asyncio.Lock()
+        async with _chat_init_locks[lock_key]:
+            # 二次检查：可能在等锁期间已被其他协程绑定
+            already = get_chat_id(cookies)
+            if already:
+                print(f"Reusing chat_id bound during lock wait: {already}")
+                async with make_client(timeout=30) as _c:
+                    fresh_last_msg = await init_chat_on_server(_c, already, cookies)
+                return already, fresh_last_msg, True
+            cid, last_msg, is_real = await create_new_chat(cookies)
+            if cid and is_real:
+                set_chat_id(cookies, cid)
+            print(f"New chat created: {cid}, last_message_id: {last_msg}, is_real: {is_real}")
+            return cid, last_msg, is_real
 
     async def _fresh_chat() -> tuple[str, str | None, bool]:
         """清除过期绑定，强制获取新 chat（404 重试路径）。"""
@@ -311,9 +344,12 @@ async def chat_completions(request: Request):
         print(f"Fresh chat created: {cid}, is_real: {is_real}")
         return cid, last_msg, is_real
 
-    chat_id, last_message_id, is_real_chat = await _get_chat()
-
-    handler_id = await resolve_handler_id(model, cookies)
+    try:
+        chat_id, last_message_id, is_real_chat = await _get_chat()
+        handler_id = await resolve_handler_id(model, cookies)
+    except Exception:
+        _busy_cookies.discard(cookie_key)
+        raise
     print(f"Requested model: {model}, handler ID: {handler_id}")
 
     # Gemini 模型最大 65536
@@ -355,6 +391,7 @@ async def chat_completions(request: Request):
                     ):
                         yield chunk
             finally:
+                _busy_cookies.discard(cookie_key)
                 await client.aclose()
 
         return StreamingResponse(
@@ -368,12 +405,15 @@ async def chat_completions(request: Request):
 
     # 非流式
     try:
-        async with make_client(timeout=120) as client:
-            raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
-    except _ChatNotFoundError:
-        chat_id, last_message_id, is_real_chat = await _fresh_chat()
-        async with make_client(timeout=120) as client:
-            raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
+        try:
+            async with make_client(timeout=120) as client:
+                raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
+        except _ChatNotFoundError:
+            chat_id, last_message_id, is_real_chat = await _fresh_chat()
+            async with make_client(timeout=120) as client:
+                raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
+    finally:
+        _busy_cookies.discard(cookie_key)
     print(f"Response size: {len(raw)} bytes")
 
     events = _parse_sse_events(raw)
