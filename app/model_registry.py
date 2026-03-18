@@ -12,7 +12,8 @@ _CACHE_TTL = 600  # 10 分钟
 
 # 按 cookie 独立缓存：cookie_key -> (cached_at, mapping, models_list)
 _cache: dict[str, tuple[float, dict[str, str], list[dict]]] = {}
-_cache_lock = asyncio.Lock()
+# per-cookie 独立锁：不同 cookie 的缓存刷新完全并行
+_locks: dict[str, asyncio.Lock] = {}
 
 
 def _normalize(name: str) -> str:
@@ -71,7 +72,10 @@ async def _fetch_models(cookies: str) -> tuple[dict[str, str], list[dict]]:
 async def get_model_mapping(cookies: str) -> dict[str, str]:
     """返回该 cookie 对应的缓存 mapping，过期则自动刷新。"""
     key = _cookie_key(cookies)
-    async with _cache_lock:
+    # 获取或创建该 cookie 的独立锁，不同 cookie 的刷新完全并行
+    if key not in _locks:
+        _locks[key] = asyncio.Lock()
+    async with _locks[key]:
         cached_at, mapping, _ = _cache.get(key, (0.0, {}, []))
         if time.time() - cached_at > _CACHE_TTL:
             try:

@@ -55,6 +55,9 @@ class CookieStore(Protocol):
     def set_chat_id(self, cookie: str, chat_id: str) -> None: ...
     """将 chat_id 绑定到指定 cookie。"""
 
+    def get_chat_id(self, cookie: str) -> str | None: ...
+    """查询指定 cookie 当前绑定的 chat_id，无绑定返回 None。"""
+
     def clear_chat_id(self, cookie: str) -> None: ...
     """清除指定 cookie 绑定的 chat_id（chat 失效时调用）。"""
 
@@ -172,6 +175,16 @@ class SQLiteStore:
                 (chat_id, cookie),
             )
             conn.commit()
+
+    def get_chat_id(self, cookie: str) -> str | None:
+        """查询指定 cookie 当前绑定的 chat_id，无绑定返回 None。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT chat_id FROM cookies WHERE value = ?", (cookie,)
+            ).fetchone()
+        if row:
+            return row["chat_id"] or None
+        return None
 
     def clear_chat_id(self, cookie: str) -> None:
         """清除指定 cookie 绑定的 chat_id（chat 失效时调用）。"""
@@ -340,6 +353,13 @@ class RedisStore:
         meta = json.loads(raw) if raw else {}
         meta["chat_id"] = chat_id
         self._r.hset(self._META_KEY, cookie, json.dumps(meta))
+
+    def get_chat_id(self, cookie: str) -> str | None:
+        import json
+        raw = self._r.hget(self._META_KEY, cookie)
+        if not raw:
+            return None
+        return json.loads(raw).get("chat_id") or None
 
     def clear_chat_id(self, cookie: str) -> None:
         import json

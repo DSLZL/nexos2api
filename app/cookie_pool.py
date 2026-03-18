@@ -75,6 +75,11 @@ def set_chat_id(cookie: str, chat_id: str) -> None:
     _store.set_chat_id(cookie, chat_id)
 
 
+def get_chat_id(cookie: str) -> str | None:
+    """查询指定 cookie 当前绑定的 chat_id，无绑定返回 None。"""
+    return _store.get_chat_id(cookie)
+
+
 def clear_chat_id(cookie: str) -> None:
     """清除指定 cookie 绑定的 chat_id（chat 在服务器上已失效时调用）。"""
     _store.clear_chat_id(cookie)
