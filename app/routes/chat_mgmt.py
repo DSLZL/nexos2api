@@ -45,7 +45,7 @@ async def create_chat(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
     try:
-        new_chat_id = await create_new_chat(cookies)
+        new_chat_id, _, _ = await create_new_chat(cookies)
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 

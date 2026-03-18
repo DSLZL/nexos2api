@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexos2API · Cookie 管理</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0d14;
+    --surface: #111520;
+    --surface2: #1a1f2e;
+    --border: #252a3d;
+    --border-focus: #6366f1;
+    --text: #e2e8f0;
+    --text-muted: #64748b;
+    --text-dim: #94a3b8;
+    --primary: #6366f1;
+    --primary-hover: #5254cc;
+    --success: #16a34a;
+    --danger: #dc2626;
+    --success-bg: #14532d;
+    --success-fg: #4ade80;
+    --danger-bg: #450a0a;
+    --danger-fg: #f87171;
+    --radius: 10px;
+    --radius-sm: 6px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 2rem;
+    line-height: 1.5;
+  }
+
+  /* Header */
+  .header { max-width: 1100px; margin-bottom: 2rem; }
+  .header h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .header h1 .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--primary);
+    display: inline-block;
+    box-shadow: 0 0 8px var(--primary);
+  }
+  .subtitle { color: var(--text-muted); font-size: 0.875rem; margin-top: 0.3rem; }
+
+  /* Layout */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
+    max-width: 1100px;
+    margin-bottom: 1.25rem;
+  }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+
+  /* Card */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+  }
+  .card-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .card-title::before {
+    content: '';
+    display: inline-block;
+    width: 3px; height: 12px;
+    background: var(--primary);
+    border-radius: 2px;
+  }
+
+  /* Textarea */
+  textarea {
+    width: 100%;
+    height: 160px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.78rem;
+    padding: 0.75rem;
+    resize: vertical;
+    outline: none;
+    transition: border-color .2s;
+    line-height: 1.6;
+  }
+  textarea:focus { border-color: var(--border-focus); }
+  textarea::placeholder { color: var(--text-muted); }
+
+  /* Buttons */
+  .btn-row { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.875rem; }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.55rem 1.1rem;
+    border-radius: var(--radius-sm);
+    border: none;
+    cursor: pointer;
+    font-size: 0.82rem;
+    font-weight: 500;
+    transition: background .15s, transform .1s;
+    user-select: none;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover { background: var(--primary-hover); }
+  .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { border-color: var(--text-muted); }
+  .btn-icon { font-size: 0.9rem; }
+
+  /* Stats */
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.75rem;
+    margin-bottom: 1.25rem;
+  }
+  .stat-item {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.875rem;
+    text-align: center;
+  }
+  .stat-num {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1;
+    margin-bottom: 0.3rem;
+  }
+  .stat-lbl { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .num-total  { color: var(--text); }
+  .num-active { color: var(--success-fg); }
+  .num-dead   { color: var(--danger-fg); }
+
+  /* Table */
+  .table-wrap { overflow-x: auto; margin-top: 0.5rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  thead th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 0.55rem 0.75rem;
+    border-bottom: 1px solid var(--surface2);
+    color: var(--text-dim);
+    vertical-align: middle;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: var(--surface2); }
+  .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.76rem; color: var(--text); }
+
+  /* Badge */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 99px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .badge::before { content: ''; width: 5px; height: 5px; border-radius: 50%; display: inline-block; }
+  .badge-ok  { background: var(--success-bg); color: var(--success-fg); }
+  .badge-ok::before { background: var(--success-fg); }
+  .badge-err { background: var(--danger-bg); color: var(--danger-fg); }
+  .badge-err::before { background: var(--danger-fg); }
+
+  /* Empty / Loading state */
+  .empty-row td {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 2rem;
+    font-size: 0.82rem;
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    padding: 0.75rem 1.25rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.82rem;
+    font-weight: 500;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity .25s, transform .25s;
+    pointer-events: none;
+    z-index: 999;
+    max-width: 320px;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .toast.ok  { background: var(--success); color: #fff; }
+  .toast.err { background: var(--danger);  color: #fff; }
+
+  /* Spinner */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner {
+    display: inline-block;
+    width: 12px; height: 12px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin .6s linear infinite;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span class="dot"></span> Nexos2API <span style="color:var(--text-muted);font-weight:400">·</span> Cookie 管理</h1>
+  <p class="subtitle">Cookie 池状态监控与批量管理</p>
+</div>
+
+<div class="grid">
+  <!-- 批量添加 -->
+  <div class="card">
+    <div class="card-title">批量添加</div>
+    <textarea id="cookie-input" placeholder="每行粘贴一个 Cookie 字符串..."></textarea>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-add" onclick="addCookies()">
+        <span class="btn-icon">＋</span> 添加
+      </button>
+      <button class="btn btn-secondary" onclick="reloadEnv()">
+        <span class="btn-icon">⟳</span> 从 ENV 导入
+      </button>
+    </div>
+  </div>
+
+  <!-- 状态统计 -->
+  <div class="card">
+    <div class="card-title">状态统计</div>
+    <div class="stat-grid">
+      <div class="stat-item">
+        <div class="stat-num num-total" id="stat-total">—</div>
+        <div class="stat-lbl">总计</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-num num-active" id="stat-active">—</div>
+        <div class="stat-lbl">活跃</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-num num-dead" id="stat-dead">—</div>
+        <div class="stat-lbl">停用</div>
+      </div>
+    </div>
+    <button class="btn btn-secondary" onclick="loadTable()">
+      <span class="btn-icon">⟳</span> 刷新
+    </button>
+  </div>
+</div>
+
+<!-- Cookie 列表 -->
+<div class="card" style="max-width:1100px;">
+  <div class="card-title">Cookie 列表</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Cookie（截断）</th>
+          <th>状态</th>
+          <th>失败次数</th>
+          <th>创建时间</th>
+          <th>最后使用</th>
+        </tr>
+      </thead>
+      <tbody id="cookie-table">
+        <tr class="empty-row"><td colspan="6">加载中...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  let _toastTimer = null;
+
+  function toast(msg, ok = true) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.className = 'toast show ' + (ok ? 'ok' : 'err');
+    clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => { el.className = 'toast'; }, 3000);
+  }
+
+  function fmtDate(ts) {
+    if (!ts) return '—';
+    return new Date(ts * 1000).toLocaleString('zh-CN', {
+      month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit'
+    });
+  }
+
+  function setStats(data) {
+    document.getElementById('stat-total').textContent  = data.total;
+    document.getElementById('stat-active').textContent = data.active;
+    document.getElementById('stat-dead').textContent   = data.total - data.active;
+  }
+
+  function renderRows(cookies) {
+    if (!cookies.length) {
+      return '<tr class="empty-row"><td colspan="6">暂无数据</td></tr>';
+    }
+    return cookies.map(c => `
+      <tr>
+        <td class="mono">${c.id}</td>
+        <td class="mono">${c.value}</td>
+        <td><span class="badge ${c.is_active ? 'badge-ok' : 'badge-err'}">${c.is_active ? '活跃' : '停用'}</span></td>
+        <td style="color:${c.fail_count > 0 ? 'var(--danger-fg)' : 'var(--text-dim)'}">${c.fail_count}</td>
+        <td>${fmtDate(c.created_at)}</td>
+        <td>${fmtDate(c.last_used)}</td>
+      </tr>`).join('');
+  }
+
+  async function loadTable() {
+    try {
+      const res = await fetch('/admin/cookies');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setStats(data);
+      document.getElementById('cookie-table').innerHTML = renderRows(data.cookies);
+    } catch(e) {
+      toast('加载失败: ' + e.message, false);
+    }
+  }
+
+  async function addCookies() {
+    const cookies = document.getElementById('cookie-input').value
+      .split('\n').map(s => s.trim()).filter(Boolean);
+    if (!cookies.length) { toast('请输入至少一个 Cookie', false); return; }
+
+    const btn = document.getElementById('btn-add');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> 添加中...';
+
+    try {
+      const res = await fetch('/admin/cookies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookies })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      toast(`成功添加 ${data.added} 个，当前活跃 ${data.active_total} 个`);
+      document.getElementById('cookie-input').value = '';
+      loadTable();
+    } catch(e) {
+      toast('添加失败: ' + e.message, false);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<span class="btn-icon">＋</span> 添加';
+    }
+  }
+
+  async function reloadEnv() {
+    try {
+      const res = await fetch('/admin/cookies/reload', { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      toast(`ENV 导入完成，当前活跃 ${data.active_total} 个`);
+      loadTable();
+    } catch(e) {
+      toast('导入失败: ' + e.message, false);
+    }
+  }
+
+  loadTable();
+</script>
+</body>
+</html>

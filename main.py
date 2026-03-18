@@ -3,7 +3,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from app.config import SERVER_HOST, SERVER_PORT
-from app.routes import chat, chat_mgmt, files, models
+from app.routes import chat, chat_mgmt, cookies, files, models
 
 app = FastAPI(title="Nexos2API", version="1.0.0")
 
@@ -11,6 +11,7 @@ app.include_router(models.router)
 app.include_router(files.router)
 app.include_router(chat.router)
 app.include_router(chat_mgmt.router)
+app.include_router(cookies.router)
 
 
 @app.get("/")

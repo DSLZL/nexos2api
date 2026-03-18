@@ -10,8 +10,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.chat_store import create_new_chat
 from app.config import BASE_URL
+from app.cookie_pool import clear_chat_id, get_next_with_chat, set_chat_id
 from app.nexos_client import (
-    _get_cookies,
     build_headers,
     build_nexos_payload,
     generate_message_id,
@@ -22,6 +22,9 @@ from app.nexos_client import (
 
 router = APIRouter()
 
+
+class _ChatNotFoundError(Exception):
+    """Nexos 返回 404 Chat not found，需要重建 chat_id。"""
 
 def _server_host(request: Request) -> str:
     return request.headers.get("host") or f"{os.getenv('HOST', '0.0.0.0')}:{os.getenv('PORT', '3000')}"
@@ -61,6 +64,8 @@ async def _nexos_stream(
         if resp.status_code != 200:
             body = await resp.aread()
             print(f"Nexos error body: {body[:500]}")
+            if resp.status_code == 404:
+                raise _ChatNotFoundError()
             return
         async for chunk in resp.aiter_bytes():
             if chunk:
@@ -279,15 +284,34 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=400, content={"error": "No user message found"})
     print("User message:", user_text[:200])
 
-    # 验证并获取 cookies
+    # 验证并获取 cookies（每个 cookie 绑定独立 chat_id）
     try:
-        cookies = _get_cookies()
+        cookies, bound_chat_id = get_next_with_chat()
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # 每次请求获取最新 chat_id 及 last_session_message_id（一次请求完成）
-    chat_id, last_message_id, is_real_chat = await create_new_chat(cookies)
-    print(f"Chat ID: {chat_id}, last_message_id: {last_message_id}, is_real: {is_real_chat}")
+    async def _get_chat() -> tuple[str, str | None, bool]:
+        """优先复用绑定的 chat_id，否则创建新 chat。"""
+        if bound_chat_id:
+            print(f"Reusing bound chat_id: {bound_chat_id}")
+            return bound_chat_id, None, True
+        cid, last_msg, is_real = await create_new_chat(cookies)
+        if cid and is_real:
+            set_chat_id(cookies, cid)
+        print(f"New chat created: {cid}, last_message_id: {last_msg}, is_real: {is_real}")
+        return cid, last_msg, is_real
+
+    async def _fresh_chat() -> tuple[str, str | None, bool]:
+        """清除过期绑定，强制获取新 chat（404 重试路径）。"""
+        print("Chat not found on server, clearing stale binding and retrying...")
+        clear_chat_id(cookies)
+        cid, last_msg, is_real = await create_new_chat(cookies)
+        if cid and is_real:
+            set_chat_id(cookies, cid)
+        print(f"Fresh chat created: {cid}, is_real: {is_real}")
+        return cid, last_msg, is_real
+
+    chat_id, last_message_id, is_real_chat = await _get_chat()
 
     handler_id = await resolve_handler_id(model, cookies)
     print(f"Requested model: {model}, handler ID: {handler_id}")
@@ -299,29 +323,37 @@ async def chat_completions(request: Request):
 
     server_host = _server_host(request)
 
-    payload = build_nexos_payload(
-        chat_id=chat_id,
-        handler_id=handler_id,
-        user_text=user_text,
-        last_message_id=last_message_id,
-        temperature=temperature,
-        max_tokens=max_tokens if body.get("max_tokens") else None,
-        is_real_chat=is_real_chat,
-    )
-    print("Nexos payload:", json.dumps(payload, ensure_ascii=False))
+    def _make_payload(cid: str, last_msg: str | None, is_real: bool) -> dict:
+        return build_nexos_payload(
+            chat_id=cid,
+            handler_id=handler_id,
+            user_text=user_text,
+            last_message_id=last_msg,
+            temperature=temperature,
+            max_tokens=max_tokens if body.get("max_tokens") else None,
+            is_real_chat=is_real,
+        )
+
+    print("Nexos payload:", json.dumps(_make_payload(chat_id, last_message_id, is_real_chat), ensure_ascii=False))
 
     if stream:
-        # 流式：client 生命周期由生成器内部管理，不能用 async with 包裹
         async def _stream_with_client() -> AsyncIterator[str]:
+            _cid, _last_msg, _is_real = chat_id, last_message_id, is_real_chat
             client = make_client(timeout=120)
             try:
-                async for chunk in _stream_openai(
-                    _nexos_stream(client, chat_id, payload, cookies),
-                    model,
-                    chat_id,
-                    server_host,
-                ):
-                    yield chunk
+                try:
+                    async for chunk in _stream_openai(
+                        _nexos_stream(client, _cid, _make_payload(_cid, _last_msg, _is_real), cookies),
+                        model, _cid, server_host,
+                    ):
+                        yield chunk
+                except _ChatNotFoundError:
+                    _cid, _last_msg, _is_real = await _fresh_chat()
+                    async for chunk in _stream_openai(
+                        _nexos_stream(client, _cid, _make_payload(_cid, _last_msg, _is_real), cookies),
+                        model, _cid, server_host,
+                    ):
+                        yield chunk
             finally:
                 await client.aclose()
 
@@ -334,9 +366,14 @@ async def chat_completions(request: Request):
             },
         )
 
-    # 非流式：正常 async with 即可
-    async with make_client(timeout=120) as client:
-        raw = await _collect_response(client, chat_id, payload, cookies)
+    # 非流式
+    try:
+        async with make_client(timeout=120) as client:
+            raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
+    except _ChatNotFoundError:
+        chat_id, last_message_id, is_real_chat = await _fresh_chat()
+        async with make_client(timeout=120) as client:
+            raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
     print(f"Response size: {len(raw)} bytes")
 
     events = _parse_sse_events(raw)
