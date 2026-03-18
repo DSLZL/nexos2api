@@ -26,6 +26,28 @@ def _cookie_key(cookies: str) -> str:
     return cookies[:32]
 
 
+def _infer_owned_by(name: str) -> str:
+    """根据模型名称推断 owned_by 字段。"""
+    n = name.lower()
+    if any(k in n for k in ("claude", "anthropic")):
+        return "anthropic"
+    if any(k in n for k in ("gpt", "o1", "o3", "o4", "chatgpt", "dall-e", "whisper", "tts")):
+        return "openai"
+    if any(k in n for k in ("gemini", "palm", "bard")):
+        return "google"
+    if any(k in n for k in ("grok",)):
+        return "xai"
+    if any(k in n for k in ("llama", "meta")):
+        return "meta"
+    if any(k in n for k in ("mistral", "mixtral")):
+        return "mistralai"
+    if any(k in n for k in ("deepseek",)):
+        return "deepseek"
+    if any(k in n for k in ("qwen", "tongyi")):
+        return "alibaba"
+    return "openai"
+
+
 async def _fetch_models(cookies: str) -> tuple[dict[str, str], list[dict]]:
     """请求 /api/model-likes 并解析。
 
@@ -62,7 +84,7 @@ async def _fetch_models(cookies: str) -> tuple[dict[str, str], list[dict]]:
             "id": normalized,
             "object": "model",
             "created": now,
-            "owned_by": "nexos",
+            "owned_by": _infer_owned_by(custom_name),
             "name": custom_name,
         })
 

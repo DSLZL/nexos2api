@@ -128,11 +128,9 @@ async def init_chat_on_server(
         if resp.status_code == 200:
             data = resp.json()
             msg_id = data.get("last_session_message_id") or data.get("lastSessionMessageId")
-            print(f"✓ Chat initialized on server, last_session_message_id: {msg_id}")
             return msg_id
-        print(f"Warning: chat init returned {resp.status_code}")
-    except Exception as exc:
-        print(f"Warning: failed to init chat on server: {exc}")
+    except Exception:
+        pass
     return None
 
 

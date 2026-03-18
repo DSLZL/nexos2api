@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.chat_store import create_new_chat
 from app.config import BASE_URL
+from app.sanitizer import sanitize_text
 from app.cookie_pool import clear_chat_id, get_chat_id, get_next_with_chat, set_chat_id
 from app.nexos_client import (
     build_headers,
@@ -67,16 +68,12 @@ async def _nexos_stream(
         headers=build_headers(chat_id, cookies),
         timeout=120,
     ) as resp:
-        print(f"Nexos response status: {resp.status_code}")
         if resp.status_code != 200:
-            body = await resp.aread()
-            print(f"Nexos error body: {body[:500]}")
+            await resp.aread()
             if resp.status_code == 404:
                 raise _ChatNotFoundError()
             return
         async for chunk in resp.aiter_bytes():
-            if chunk:
-                print(f"Chunk ({len(chunk)} bytes): {chunk[:200]}")
             yield chunk
 
 
@@ -199,6 +196,7 @@ async def _stream_openai(
                 continue
 
             text = replace_image_links(text, chat_id, server_host, file_mapping)
+            text = sanitize_text(text)
 
             chunk = {
                 "id": f"chatcmpl-{generate_message_id()}",
@@ -240,6 +238,7 @@ async def _stream_openai(
                         text = event["text"]
                 if text:
                     text = replace_image_links(text, chat_id, server_host, file_mapping)
+                    text = sanitize_text(text)
                     chunk = {
                         "id": f"chatcmpl-{generate_message_id()}",
                         "object": "chat.completion.chunk",
@@ -277,9 +276,6 @@ async def chat_completions(request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
 
-    print("\n=== New chat request ===")
-    print("Messages:", json.dumps(body.get("messages", []), ensure_ascii=False))
-
     messages: list[dict] = body.get("messages", [])
     model: str = body.get("model") or "nexos-chat"
     temperature: float = body.get("temperature", 1)
@@ -289,7 +285,6 @@ async def chat_completions(request: Request):
     user_text = _extract_user_text(messages)
     if not user_text:
         return JSONResponse(status_code=400, content={"error": "No user message found"})
-    print("User message:", user_text[:200])
 
     # 验证并获取 cookies（每个 cookie 绑定独立 chat_id）
     try:
@@ -311,8 +306,6 @@ async def chat_completions(request: Request):
     async def _get_chat() -> tuple[str, str | None, bool]:
         """优先复用绑定的 chat_id；否则加 per-cookie 锁创建，防并发重复获取。"""
         if bound_chat_id:
-            print(f"Reusing bound chat_id: {bound_chat_id}")
-            # 刷新 last_message_id，避免 parent_id isn't of latest message 错误
             async with make_client(timeout=30) as _c:
                 fresh_last_msg = await init_chat_on_server(_c, bound_chat_id, cookies)
             return bound_chat_id, fresh_last_msg, True
@@ -331,17 +324,14 @@ async def chat_completions(request: Request):
             cid, last_msg, is_real = await create_new_chat(cookies)
             if cid and is_real:
                 set_chat_id(cookies, cid)
-            print(f"New chat created: {cid}, last_message_id: {last_msg}, is_real: {is_real}")
             return cid, last_msg, is_real
 
     async def _fresh_chat() -> tuple[str, str | None, bool]:
         """清除过期绑定，强制获取新 chat（404 重试路径）。"""
-        print("Chat not found on server, clearing stale binding and retrying...")
         clear_chat_id(cookies)
         cid, last_msg, is_real = await create_new_chat(cookies)
         if cid and is_real:
             set_chat_id(cookies, cid)
-        print(f"Fresh chat created: {cid}, is_real: {is_real}")
         return cid, last_msg, is_real
 
     try:
@@ -350,12 +340,10 @@ async def chat_completions(request: Request):
     except Exception:
         _busy_cookies.discard(cookie_key)
         raise
-    print(f"Requested model: {model}, handler ID: {handler_id}")
 
     # Gemini 模型最大 65536
     if max_tokens and "gemini" in model.lower() and max_tokens > 65536:
         max_tokens = 65536
-        print(f"Adjusted max_tokens to 65536 for Gemini model")
 
     server_host = _server_host(request)
 
@@ -370,7 +358,6 @@ async def chat_completions(request: Request):
             is_real_chat=is_real,
         )
 
-    print("Nexos payload:", json.dumps(_make_payload(chat_id, last_message_id, is_real_chat), ensure_ascii=False))
 
     if stream:
         async def _stream_with_client() -> AsyncIterator[str]:
@@ -414,7 +401,6 @@ async def chat_completions(request: Request):
                 raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
     finally:
         _busy_cookies.discard(cookie_key)
-    print(f"Response size: {len(raw)} bytes")
 
     events = _parse_sse_events(raw)
     text, file_mapping = _extract_text_and_files(events)
