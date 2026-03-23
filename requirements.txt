@@ -3,6 +3,7 @@ uvicorn[standard]>=0.30.0
 httpx[socks]>=0.27.0
 python-dotenv>=1.0.0
 python-multipart>=0.0.9
+jinja2>=3.0.0
 
 # 可选：Redis 后端（COOKIE_STORE_BACKEND=redis 时需要）
 redis>=4.0.0
