@@ -8,3 +8,6 @@ __pycache__/
 .serena/
 .spec-workflow/
 CLAUDE.md
+cookie.md
+cookies.db
+logs.db
