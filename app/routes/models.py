@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from app.model_registry import get_models_list
-from app.nexos_client import _get_cookies
+from app.cookie_pool import get_next as _get_cookies
 from fastapi.responses import JSONResponse
 
 router = APIRouter()

@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.chat_store import create_new_chat, get_current_chat_id, set_current_chat_id
 from app.config import BASE_URL
-from app.nexos_client import _get_cookies
+from app.cookie_pool import get_next as _get_cookies
 
 router = APIRouter()
 
@@ -17,7 +17,7 @@ async def get_current_chat():
     chat_id = get_current_chat_id()
     if not chat_id:
         return JSONResponse(status_code=404, content={"error": "No active chat. Call POST /v1/chat/new to create one."})
-    return {"chatId": chat_id, "url": f"{BASE_URL}/chat/{chat_id}"}
+    return {"chatId": chat_id}
 
 
 @router.post("/v1/chat/switch")
@@ -45,7 +45,7 @@ async def create_chat(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
     try:
-        new_chat_id = await create_new_chat(cookies)
+        new_chat_id, _, _ = await create_new_chat(cookies)
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -55,7 +55,6 @@ async def create_chat(request: Request):
     return {
         "success": True,
         "chatId": new_chat_id,
-        "url": f"{BASE_URL}/chat/{new_chat_id}",
         "currentChat": auto_switch,
         "message": (
             f"New chat created and set as current: {new_chat_id}"

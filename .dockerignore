@@ -1,0 +1,33 @@
+# 版本控制
+.git/
+.gitignore
+
+# 运行时数据（挂载卷提供）
+*.db
+*.db-shm
+*.db-wal
+current-chat.json
+
+# 敏感配置（通过环境变量注入）
+.env
+
+# 开发/工具目录
+.claude/
+.serena/
+.spec-workflow/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 文档
+README.md
+cookie.md
+CLAUDE.md
+
+# 测试
+tests/
+*.test.py

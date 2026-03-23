@@ -34,21 +34,6 @@ def set_current_chat_id(chat_id: str) -> bool:
         return False
 
 
-async def _parse_cookies(cookies_str: str) -> list[dict]:
-    """将 cookie 字符串解析为 Playwright 可用的 dict 列表。"""
-    result = []
-    for part in cookies_str.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, _, value = part.partition("=")
-            result.append({
-                "name": name.strip(),
-                "value": value.strip(),
-                "domain": "workspace.nexos.ai",
-                "path": "/",
-            })
-    return result
-
 
 async def browser_create_chat(cookies: str) -> tuple[str, str | None, bool]:
     """
@@ -100,12 +85,3 @@ async def create_new_chat(cookies: str) -> tuple[str, str | None, bool]:
     """
     return await browser_create_chat(cookies)
 
-
-async def get_or_create_chat_id(cookies: str) -> str:
-    """返回当前 chat ID；若不存在则自动创建并持久化。"""
-    cid = get_current_chat_id()
-    if cid:
-        return cid
-    cid, _, _ = await create_new_chat(cookies)
-    set_current_chat_id(cid)
-    return cid

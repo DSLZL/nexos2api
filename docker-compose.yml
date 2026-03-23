@@ -1,0 +1,61 @@
+# Nexos2API — Docker Compose
+# 使用方式：
+#   cp .env.example .env && vim .env   # 填写 NEXOS_COOKIES_* 等必填项
+#   docker compose up -d
+#
+# 默认使用 SQLite 后端（零依赖）。
+# 如需 Redis 后端，取消注释 redis 服务和 app 中的 Redis 相关环境变量。
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nexos2api:latest
+    container_name: nexos2api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      # SQLite 数据持久化
+      - nexos_data:/data
+    env_file:
+      - .env
+    environment:
+      # 运行时路径（容器内固定，不从 .env 覆盖）
+      COOKIE_DB_PATH: /data/cookies.db
+      HOST: 0.0.0.0
+      PORT: "3000"
+      # ── Redis 后端（取消注释并配置 redis 服务后启用）──
+      # COOKIE_STORE_BACKEND: redis
+      # REDIS_URL: redis://redis:6379/0
+    # depends_on:
+    #   redis:
+    #     condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:3000/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Redis 后端（可选，COOKIE_STORE_BACKEND=redis 时启用）────────────────
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: nexos2api-redis
+  #   restart: unless-stopped
+  #   command: redis-server --save 60 1 --loglevel warning
+  #   volumes:
+  #     - redis_data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 3
+
+volumes:
+  nexos_data:
+    driver: local
+  # redis_data:
+  #   driver: local
