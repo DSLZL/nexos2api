@@ -127,3 +127,11 @@ async def get_handler_id(model: str, cookies: str) -> str:
         print(f"Warning: model '{model}' not found in registry, using DEFAULT_HANDLER_ID")
         return DEFAULT_HANDLER_ID
     return result
+
+
+def get_cached_model_count() -> int:
+    """从缓存同步读取任意一个 cookie 的模型数量（仅用于统计展示）。"""
+    if not _cache:
+        return 0
+    _, _, models = next(iter(_cache.values()))
+    return len(models)

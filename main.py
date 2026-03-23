@@ -7,8 +7,10 @@ from fastapi import FastAPI
 
 from app.config import SERVER_HOST, SERVER_PORT
 from app.cookie_pool import list_all
+from app.cookie_health import health_check_loop
 from app.model_registry import get_model_mapping
 from app.routes import chat, chat_mgmt, cookies, files, models
+from app.routes.stats import router as stats_router
 
 
 async def _warmup() -> None:
@@ -30,7 +32,15 @@ async def _warmup() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _warmup()
-    yield
+    health_task = asyncio.create_task(health_check_loop())
+    try:
+        yield
+    finally:
+        health_task.cancel()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Nexos2API", version="1.0.0", lifespan=lifespan)
@@ -40,6 +50,7 @@ app.include_router(files.router)
 app.include_router(chat.router)
 app.include_router(chat_mgmt.router)
 app.include_router(cookies.router)
+app.include_router(stats_router)
 
 
 @app.get("/")

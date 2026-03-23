@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.chat_store import create_new_chat, get_current_chat_id, set_current_chat_id
 from app.config import BASE_URL
-from app.nexos_client import _get_cookies
+from app.cookie_pool import get_next as _get_cookies
 
 router = APIRouter()
 

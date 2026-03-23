@@ -6,7 +6,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from app.config import BASE_URL, COMMON_HEADERS, DEFAULT_HANDLER_ID
+from app.config import BASE_URL, COMMON_HEADERS, DEFAULT_HANDLER_ID, NEXOS_VERIFY_SSL, PROXY_URL
 
 
 def build_headers(chat_id: str, cookies: str, extra: dict | None = None) -> dict:
@@ -25,12 +25,6 @@ def build_headers(chat_id: str, cookies: str, extra: dict | None = None) -> dict
     return headers
 
 
-def _get_cookies() -> str:
-    """向下兼容：从 pool 取下一个 cookie。"""
-    from app.cookie_pool import get_next
-    return get_next()
-
-
 async def resolve_handler_id(model: str, cookies: str) -> str:
     """动态查找 model -> handler ID，失败时返回 DEFAULT_HANDLER_ID。"""
     from app.model_registry import get_handler_id
@@ -38,9 +32,11 @@ async def resolve_handler_id(model: str, cookies: str) -> str:
 
 
 def make_client(**kwargs) -> "httpx.AsyncClient":
-    """统一工厂：所有 AsyncClient 通过此处创建，集中管理 SSL/超时/重定向配置。"""
-    kwargs.setdefault("verify", False)
+    """统一工厂：所有 AsyncClient 通过此处创建，集中管理 SSL/超时/重定向/代理配置。"""
+    kwargs.setdefault("verify", NEXOS_VERIFY_SSL)
     kwargs.setdefault("follow_redirects", True)
+    if PROXY_URL and "proxy" not in kwargs:
+        kwargs["proxy"] = PROXY_URL
     return httpx.AsyncClient(**kwargs)
 
 
@@ -132,28 +128,6 @@ async def init_chat_on_server(
     except Exception:
         pass
     return None
-
-
-async def nexos_stream(
-    client: httpx.AsyncClient,
-    chat_id: str,
-    cookies: str,
-    payload: dict,
-) -> AsyncIterator[bytes]:
-    """向 nexos 发送 multipart 请求并流式返回原始字节。"""
-    async with client.stream(
-        "POST",
-        f"{BASE_URL}/api/chat/{chat_id}",
-        files=[
-            ("action", (None, json.dumps("chat_completion"), "text/plain")),
-            ("chatId", (None, json.dumps(chat_id), "text/plain")),
-            ("data", (None, json.dumps(payload), "text/plain")),
-        ],
-        headers=build_headers(chat_id, cookies),
-        timeout=120,
-    ) as resp:
-        async for chunk in resp.aiter_bytes():
-            yield chunk
 
 
 async def download_file(

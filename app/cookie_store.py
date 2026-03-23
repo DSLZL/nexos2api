@@ -17,6 +17,7 @@ from typing import Optional, Protocol, runtime_checkable
 from app.config import (
     COOKIE_DB_PATH,
     COOKIE_MAX_FAIL_COUNT,
+    COOKIE_ROTATION_STRATEGY,
     COOKIE_STORE_BACKEND,
     REDIS_URL,
 )
@@ -35,6 +36,14 @@ class CookieRecord:
     last_used: Optional[float]
     created_at: float
     chat_id: str = ""
+    last_success_at: Optional[float] = None
+    total_requests: int = 0
+    success_count: int = 0
+    cooldown_until: Optional[float] = None
+    label: str = ""
+    priority: int = 0
+    last_health_check_at: Optional[float] = None
+    health_status: str = "unknown"  # unknown | healthy | unhealthy
 
 
 # ─────────────────────────────────────────────────
@@ -73,6 +82,14 @@ class CookieStore(Protocol):
     def size(self) -> int: ...
     """返回活跃 Cookie 数量。"""
 
+    def update_cookie(self, cookie: str, label: str | None, priority: int | None, is_active: bool | None) -> bool: ...
+    """更新 Cookie 元信息（label/priority/is_active），返回是否找到记录。"""
+
+    def delete_cookie(self, cookie: str) -> bool: ...
+
+    def record_health(self, cookie: str, healthy: bool) -> None: ...
+    """从存储中永久删除指定 Cookie，返回是否找到记录。"""
+
 
 # ─────────────────────────────────────────────────
 # SQLite 实现
@@ -80,17 +97,36 @@ class CookieStore(Protocol):
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS cookies (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    value      TEXT UNIQUE NOT NULL,
-    is_active  INTEGER DEFAULT 1,
-    fail_count INTEGER DEFAULT 0,
-    last_used  REAL,
-    created_at REAL NOT NULL,
-    chat_id    TEXT DEFAULT ''
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    value                 TEXT UNIQUE NOT NULL,
+    is_active             INTEGER DEFAULT 1,
+    fail_count            INTEGER DEFAULT 0,
+    last_used             REAL,
+    created_at            REAL NOT NULL,
+    chat_id               TEXT DEFAULT '',
+    last_success_at       REAL,
+    total_requests        INTEGER DEFAULT 0,
+    success_count         INTEGER DEFAULT 0,
+    cooldown_until        REAL,
+    label                 TEXT DEFAULT '',
+    priority              INTEGER DEFAULT 0,
+    last_health_check_at  REAL,
+    health_status         TEXT DEFAULT 'unknown'
 )
 """
 
-_MIGRATE_ADD_CHAT_ID = "ALTER TABLE cookies ADD COLUMN chat_id TEXT DEFAULT ''"
+# 旧表迁移：按列名逐一检测补全
+_MIGRATIONS: list[str] = [
+    "ALTER TABLE cookies ADD COLUMN chat_id TEXT DEFAULT ''",
+    "ALTER TABLE cookies ADD COLUMN last_success_at REAL",
+    "ALTER TABLE cookies ADD COLUMN total_requests INTEGER DEFAULT 0",
+    "ALTER TABLE cookies ADD COLUMN success_count INTEGER DEFAULT 0",
+    "ALTER TABLE cookies ADD COLUMN cooldown_until REAL",
+    "ALTER TABLE cookies ADD COLUMN label TEXT DEFAULT ''",
+    "ALTER TABLE cookies ADD COLUMN priority INTEGER DEFAULT 0",
+    "ALTER TABLE cookies ADD COLUMN last_health_check_at REAL",
+    "ALTER TABLE cookies ADD COLUMN health_status TEXT DEFAULT 'unknown'",
+]
 
 
 class SQLiteStore:
@@ -115,17 +151,20 @@ class SQLiteStore:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(_CREATE_TABLE)
-            # 迁移：若旧表缺少 chat_id 列则补充
             cols = {row[1] for row in conn.execute("PRAGMA table_info(cookies)")}
-            if "chat_id" not in cols:
-                conn.execute(_MIGRATE_ADD_CHAT_ID)
+            for stmt in _MIGRATIONS:
+                # 从 ALTER TABLE ADD COLUMN 语句中提取列名
+                col_name = stmt.split("ADD COLUMN ")[1].split()[0]
+                if col_name not in cols:
+                    conn.execute(stmt)
             conn.commit()
 
     def add_cookies(self, cookies: list[str]) -> int:
         added = 0
         with self._lock, self._connect() as conn:
             for cookie in cookies:
-                cookie = cookie.strip()
+                # 与 _load_from_env 保持一致：移除所有换行符再 strip
+                cookie = cookie.replace("\r", "").replace("\n", "").strip()
                 if not cookie:
                     continue
                 try:
@@ -147,20 +186,33 @@ class SQLiteStore:
         return cookie
 
     def get_next_with_chat(self) -> tuple[str, str | None]:
-        """原子 round-robin：返回 (cookie, chat_id)，chat_id 为 None 表示尚未绑定。"""
+        """按 COOKIE_ROTATION_STRATEGY 选取下一个可用 Cookie。
+
+        - weighted   (默认): priority DESC, last_used ASC
+        - round-robin:       纯 last_used ASC（忽略 priority）
+        - least-used:        total_requests ASC, last_used ASC
+        """
+        if COOKIE_ROTATION_STRATEGY == "round-robin":
+            order = "ORDER BY last_used ASC NULLS FIRST"
+        elif COOKIE_ROTATION_STRATEGY == "least-used":
+            order = "ORDER BY total_requests ASC, last_used ASC NULLS FIRST"
+        else:  # weighted（默认）
+            order = "ORDER BY priority DESC, last_used ASC NULLS FIRST"
+
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT id, value, chat_id FROM cookies "
                 "WHERE is_active = 1 "
-                "ORDER BY last_used ASC NULLS FIRST "
-                "LIMIT 1"
+                "  AND (cooldown_until IS NULL OR cooldown_until <= strftime('%s','now')) "
+                + order +
+                " LIMIT 1"
             ).fetchone()
             if row is None:
                 raise RuntimeError(
-                    "Cookie 池为空或全部失效，请添加有效 Cookie。"
+                    "Cookie 池为空或全部失效/冷却中，请添加有效 Cookie。"
                 )
             conn.execute(
-                "UPDATE cookies SET last_used = ? WHERE id = ?",
+                "UPDATE cookies SET last_used = ?, total_requests = total_requests + 1 WHERE id = ?",
                 (time.time(), row["id"]),
             )
             conn.commit()
@@ -196,29 +248,39 @@ class SQLiteStore:
             conn.commit()
 
     def mark_failed(self, cookie: str) -> None:
+        """标记失败：累计超阈值停用；否则设置冷却到期时间。"""
+        from app.config import COOKIE_COOLDOWN_SECONDS
         with self._lock, self._connect() as conn:
+            cooldown_until = time.time() + COOKIE_COOLDOWN_SECONDS if COOKIE_COOLDOWN_SECONDS > 0 else None
             conn.execute(
                 "UPDATE cookies "
                 "SET fail_count = fail_count + 1, "
-                "    is_active = CASE WHEN fail_count + 1 >= ? THEN 0 ELSE is_active END "
+                "    is_active = CASE WHEN fail_count + 1 >= ? THEN 0 ELSE is_active END, "
+                "    cooldown_until = CASE WHEN fail_count + 1 >= ? THEN NULL ELSE ? END "
                 "WHERE value = ?",
-                (COOKIE_MAX_FAIL_COUNT, cookie),
+                (COOKIE_MAX_FAIL_COUNT, COOKIE_MAX_FAIL_COUNT, cooldown_until, cookie),
             )
             conn.commit()
 
     def mark_success(self, cookie: str) -> None:
+        """标记成功：重置失败计数、清除冷却，更新成功统计。"""
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE cookies SET fail_count = 0, is_active = 1 WHERE value = ?",
-                (cookie,),
+                "UPDATE cookies "
+                "SET fail_count = 0, is_active = 1, cooldown_until = NULL, "
+                "    last_success_at = ?, success_count = success_count + 1 "
+                "WHERE value = ?",
+                (time.time(), cookie),
             )
             conn.commit()
 
     def list_all(self) -> list[CookieRecord]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, value, is_active, fail_count, last_used, created_at, chat_id "
-                "FROM cookies ORDER BY id"
+                "SELECT id, value, is_active, fail_count, last_used, created_at, chat_id, "
+                "       last_success_at, total_requests, success_count, cooldown_until, label, priority, "
+                "       last_health_check_at, health_status "
+                "FROM cookies ORDER BY priority DESC, id"
             ).fetchall()
         return [
             CookieRecord(
@@ -229,6 +291,14 @@ class SQLiteStore:
                 last_used=r["last_used"],
                 created_at=r["created_at"],
                 chat_id=r["chat_id"] or "",
+                last_success_at=r["last_success_at"],
+                total_requests=r["total_requests"] or 0,
+                success_count=r["success_count"] or 0,
+                cooldown_until=r["cooldown_until"],
+                label=r["label"] or "",
+                priority=r["priority"] or 0,
+                last_health_check_at=r["last_health_check_at"],
+                health_status=r["health_status"] or "unknown",
             )
             for r in rows
         ]
@@ -239,6 +309,47 @@ class SQLiteStore:
                 "SELECT COUNT(*) FROM cookies WHERE is_active = 1"
             ).fetchone()
         return row[0] if row else 0
+
+    def update_cookie(self, cookie: str, label: str | None, priority: int | None, is_active: bool | None) -> bool:
+        """更新 label / priority / is_active，跳过 None 参数。返回是否找到记录。"""
+        parts: list[str] = []
+        params: list = []
+        if label is not None:
+            parts.append("label = ?")
+            params.append(label)
+        if priority is not None:
+            parts.append("priority = ?")
+            params.append(priority)
+        if is_active is not None:
+            parts.append("is_active = ?")
+            params.append(int(is_active))
+        if not parts:
+            return True  # 无需更新
+        params.append(cookie)
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE cookies SET {', '.join(parts)} WHERE value = ?",
+                params,
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    def delete_cookie(self, cookie: str) -> bool:
+        """从存储中永久删除指定 Cookie。返回是否找到记录。"""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM cookies WHERE value = ?", (cookie,))
+            conn.commit()
+        return cur.rowcount > 0
+
+    def record_health(self, cookie: str, healthy: bool) -> None:
+        """记录健康检查结果：更新 last_health_check_at 和 health_status。"""
+        status = "healthy" if healthy else "unhealthy"
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE cookies SET last_health_check_at = ?, health_status = ? WHERE value = ?",
+                (time.time(), status, cookie),
+            )
+            conn.commit()
 
 
 # ─────────────────────────────────────────────────
@@ -274,7 +385,8 @@ class RedisStore:
         added = 0
         pipe = self._r.pipeline()
         for cookie in cookies:
-            cookie = cookie.strip()
+            # 与 _load_from_env 保持一致：移除所有换行符再 strip
+            cookie = cookie.replace("\r", "").replace("\n", "").strip()
             if not cookie:
                 continue
             # 若 meta 中已存在则跳过（HSETNX：仅在字段不存在时设置）
@@ -296,22 +408,32 @@ class RedisStore:
 
     def mark_failed(self, cookie: str) -> None:
         import json
+        from app.config import COOKIE_COOLDOWN_SECONDS
         raw = self._r.hget(self._META_KEY, cookie)
         if raw is None:
             return
         meta = json.loads(raw)
         meta["fail_count"] = meta.get("fail_count", 0) + 1
-        self._r.hset(self._META_KEY, cookie, json.dumps(meta))
         if meta["fail_count"] >= COOKIE_MAX_FAIL_COUNT:
-            # 从活跃列表移除，加入失活集合
+            # 达到阈值：移除活跃列表，加入失活集合，清除冷却
+            meta.pop("cooldown_until", None)
+            self._r.hset(self._META_KEY, cookie, json.dumps(meta))
             self._r.lrem(self._ACTIVE_KEY, 0, cookie)
             self._r.sadd(self._INACTIVE_KEY, cookie)
+        else:
+            # 未达阈值：设置冷却时间
+            if COOKIE_COOLDOWN_SECONDS > 0:
+                meta["cooldown_until"] = time.time() + COOKIE_COOLDOWN_SECONDS
+            self._r.hset(self._META_KEY, cookie, json.dumps(meta))
 
     def mark_success(self, cookie: str) -> None:
         import json
         raw = self._r.hget(self._META_KEY, cookie)
         meta = json.loads(raw) if raw else {}
         meta["fail_count"] = 0
+        meta["last_success_at"] = time.time()
+        meta["success_count"] = meta.get("success_count", 0) + 1
+        meta.pop("cooldown_until", None)
         self._r.hset(self._META_KEY, cookie, json.dumps(meta))
         # 若在失活集合中，重新激活
         if self._r.sismember(self._INACTIVE_KEY, cookie):
@@ -325,26 +447,50 @@ class RedisStore:
         all_meta = self._r.hgetall(self._META_KEY)
         for i, (cookie, raw) in enumerate(all_meta.items(), start=1):
             meta = json.loads(raw)
+            cooldown_until = meta.get("cooldown_until")
             result.append(CookieRecord(
                 id=i,
                 value=cookie,
                 is_active=cookie in active_set,
                 fail_count=meta.get("fail_count", 0),
-                last_used=None,
+                last_used=meta.get("last_used"),
                 created_at=meta.get("created_at", 0.0),
+                chat_id=meta.get("chat_id", ""),
+                last_success_at=meta.get("last_success_at"),
+                total_requests=meta.get("total_requests", 0),
+                success_count=meta.get("success_count", 0),
+                cooldown_until=cooldown_until,
+                label=meta.get("label", ""),
+                priority=meta.get("priority", 0),
+                last_health_check_at=meta.get("last_health_check_at"),
+                health_status=meta.get("health_status", "unknown"),
             ))
         return result
 
     def get_next_with_chat(self) -> tuple[str, str | None]:
         import json
-        cookie = self._r.lmove(self._ACTIVE_KEY, self._ACTIVE_KEY, "LEFT", "RIGHT")
-        if cookie is None:
-            raise RuntimeError("Cookie 池为空或全部失效，请添加有效 Cookie。")
-        raw = self._r.hget(self._META_KEY, cookie)
-        chat_id: str | None = None
-        if raw:
+        # 加权轮询：过滤冷却中，按 priority DESC / last_used ASC
+        all_meta = self._r.hgetall(self._META_KEY)
+        active_set = set(self._r.lrange(self._ACTIVE_KEY, 0, -1))
+        now = time.time()
+        candidates = []
+        for cookie, raw in all_meta.items():
+            if cookie not in active_set:
+                continue
             meta = json.loads(raw)
-            chat_id = meta.get("chat_id") or None
+            cooldown_until = meta.get("cooldown_until")
+            if cooldown_until and cooldown_until > now:
+                continue
+            candidates.append((cookie, meta))
+        if not candidates:
+            raise RuntimeError("Cookie 池为空或全部失效/冷却中，请添加有效 Cookie。")
+        # priority DESC, last_used ASC (None 视为最旧)
+        candidates.sort(key=lambda x: (-x[1].get("priority", 0), x[1].get("last_used") or 0.0))
+        cookie, meta = candidates[0]
+        meta["last_used"] = now
+        meta["total_requests"] = meta.get("total_requests", 0) + 1
+        self._r.hset(self._META_KEY, cookie, json.dumps(meta))
+        chat_id = meta.get("chat_id") or None
         return cookie, chat_id
 
     def set_chat_id(self, cookie: str, chat_id: str) -> None:
@@ -372,6 +518,52 @@ class RedisStore:
 
     def size(self) -> int:
         return self._r.llen(self._ACTIVE_KEY)
+
+    def update_cookie(self, cookie: str, label: str | None, priority: int | None, is_active: bool | None) -> bool:
+        """更新 label / priority / is_active，跳过 None 参数。返回是否找到记录。"""
+        import json
+        raw = self._r.hget(self._META_KEY, cookie)
+        if raw is None:
+            return False
+        meta = json.loads(raw)
+        if label is not None:
+            meta["label"] = label
+        if priority is not None:
+            meta["priority"] = priority
+        if is_active is not None:
+            active_set = set(self._r.lrange(self._ACTIVE_KEY, 0, -1))
+            currently_active = cookie in active_set
+            if is_active and not currently_active:
+                # 从失活集合移到活跃列表
+                self._r.srem(self._INACTIVE_KEY, cookie)
+                self._r.rpush(self._ACTIVE_KEY, cookie)
+            elif not is_active and currently_active:
+                # 从活跃列表移到失活集合
+                self._r.lrem(self._ACTIVE_KEY, 0, cookie)
+                self._r.sadd(self._INACTIVE_KEY, cookie)
+        self._r.hset(self._META_KEY, cookie, json.dumps(meta))
+        return True
+
+    def delete_cookie(self, cookie: str) -> bool:
+        """从存储中永久删除指定 Cookie，返回是否找到记录。"""
+        existed = self._r.hexists(self._META_KEY, cookie)
+        if not existed:
+            return False
+        self._r.hdel(self._META_KEY, cookie)
+        self._r.lrem(self._ACTIVE_KEY, 0, cookie)
+        self._r.srem(self._INACTIVE_KEY, cookie)
+        return True
+
+    def record_health(self, cookie: str, healthy: bool) -> None:
+        """记录健康检查结果到 Redis meta hash。"""
+        import json
+        raw = self._r.hget(self._META_KEY, cookie)
+        if raw is None:
+            return
+        meta = json.loads(raw)
+        meta["last_health_check_at"] = time.time()
+        meta["health_status"] = "healthy" if healthy else "unhealthy"
+        self._r.hset(self._META_KEY, cookie, json.dumps(meta))
 
 
 # ─────────────────────────────────────────────────

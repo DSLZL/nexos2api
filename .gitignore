@@ -14,3 +14,14 @@ CLAUDE.md
 cookies.db
 cookies.db-shm
 cookies.db-wal
+logs.db
+logs.db-shm
+logs.db-wal
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+*.swo
+
+cookie.md

@@ -113,3 +113,28 @@ def list_all() -> list[CookieRecord]:
 def add_cookies(cookies: list[str]) -> int:
     """动态添加 Cookie，返回实际新增数量。"""
     return _store.add_cookies(cookies)
+
+def update_cookie(cookie: str, label: str | None = None, priority: int | None = None, is_active: bool | None = None) -> bool:
+    """更新 Cookie 元信息（label/priority/is_active）。返回是否找到记录。"""
+    return _store.update_cookie(cookie, label, priority, is_active)
+
+
+def delete_cookie(cookie: str) -> bool:
+    """从存储中永久删除指定 Cookie。返回是否找到记录。"""
+    return _store.delete_cookie(cookie)
+
+
+def record_health(cookie: str, healthy: bool) -> None:
+    """记录健康检查结果（last_health_check_at / health_status）。"""
+    _store.record_health(cookie, healthy)
+
+
+def reload() -> int:
+    """重新从环境变量导入 Cookie，返回新增数量。"""
+    env_cookies = _load_from_env()
+    if not env_cookies:
+        return 0
+    added = _store.add_cookies(env_cookies)
+    if added:
+        print(f"[cookie_pool] reload：新增 {added} 个 Cookie")
+    return added

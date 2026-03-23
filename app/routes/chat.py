@@ -10,9 +10,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.chat_store import create_new_chat
-from app.config import BASE_URL
+from app.config import BASE_URL, DISABLE_HISTORY
 from app.sanitizer import sanitize_text
-from app.cookie_pool import clear_chat_id, get_chat_id, get_next_with_chat, set_chat_id
+from app.cookie_pool import clear_chat_id, get_chat_id, get_next_with_chat, mark_failed, mark_success, set_chat_id
+from app.request_logger import get_logger
 from app.nexos_client import (
     build_headers,
     build_nexos_payload,
@@ -304,7 +305,11 @@ async def chat_completions(request: Request):
 
     # 确保设置阶段异常时也释放 busy 标记（流式/非流式路径各自的 finally 负责正常路径）
     async def _get_chat() -> tuple[str, str | None, bool]:
-        """优先复用绑定的 chat_id；否则加 per-cookie 锁创建，防并发重复获取。"""
+        """优先复用绑定的 chat_id；否则加 per-cookie 锁创建，防并发重复获取。
+        若 DISABLE_HISTORY=true 则每次强制创建新 chat，不复用也不持久化。"""
+        if DISABLE_HISTORY:
+            cid, last_msg, is_real = await create_new_chat(cookies)
+            return cid, last_msg, is_real
         if bound_chat_id:
             async with make_client(timeout=30) as _c:
                 fresh_last_msg = await init_chat_on_server(_c, bound_chat_id, cookies)
@@ -346,6 +351,7 @@ async def chat_completions(request: Request):
         max_tokens = 65536
 
     server_host = _server_host(request)
+    _t0 = time.time()
 
     def _make_payload(cid: str, last_msg: str | None, is_real: bool) -> dict:
         return build_nexos_payload(
@@ -363,6 +369,7 @@ async def chat_completions(request: Request):
         async def _stream_with_client() -> AsyncIterator[str]:
             _cid, _last_msg, _is_real = chat_id, last_message_id, is_real_chat
             client = make_client(timeout=120)
+            _failed = False
             try:
                 try:
                     async for chunk in _stream_openai(
@@ -377,7 +384,15 @@ async def chat_completions(request: Request):
                         model, _cid, server_host,
                     ):
                         yield chunk
+            except Exception as _exc:
+                _failed = True
+                mark_failed(cookies)
+                get_logger().record(cookies, model, False, int((time.time() - _t0) * 1000), str(_exc))
+                raise
             finally:
+                if not _failed:
+                    mark_success(cookies)
+                    get_logger().record(cookies, model, True, int((time.time() - _t0) * 1000))
                 _busy_cookies.discard(cookie_key)
                 await client.aclose()
 
@@ -391,6 +406,7 @@ async def chat_completions(request: Request):
         )
 
     # 非流式
+    _failed = False
     try:
         try:
             async with make_client(timeout=120) as client:
@@ -399,7 +415,15 @@ async def chat_completions(request: Request):
             chat_id, last_message_id, is_real_chat = await _fresh_chat()
             async with make_client(timeout=120) as client:
                 raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
+    except Exception as _exc:
+        _failed = True
+        mark_failed(cookies)
+        get_logger().record(cookies, model, False, int((time.time() - _t0) * 1000), str(_exc))
+        raise
     finally:
+        if not _failed:
+            mark_success(cookies)
+            get_logger().record(cookies, model, True, int((time.time() - _t0) * 1000))
         _busy_cookies.discard(cookie_key)
 
     events = _parse_sse_events(raw)
