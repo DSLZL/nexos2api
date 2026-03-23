@@ -126,8 +126,9 @@ class RequestLogger:
             if _now - self._last_cleanup_ts >= _CLEANUP_INTERVAL:
                 self._cleanup_old(conn)
                 self._last_cleanup_ts = _now
-                # 清理后收缩 WAL 文件，归还磁盘空间
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                # 清理后尝试收缩 WAL 文件；PASSIVE 模式非阻塞，
+                # 有并发连接时不强求截断，避免 "database table is locked"
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             conn.commit()
         self._ring.append(entry)
 

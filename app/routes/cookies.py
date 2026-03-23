@@ -20,7 +20,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from app import cookie_pool
 from app.auth import require_admin
@@ -162,9 +162,6 @@ def reload_cookies():
     """重新从环境变量导入 Cookie。"""
     cookie_pool.reload()
     return {"active_total": cookie_pool.size()}
-
-
-from pydantic import field_validator, model_validator
 
 
 class BatchImportRequest(BaseModel):

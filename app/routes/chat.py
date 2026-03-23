@@ -30,6 +30,8 @@ router = APIRouter()
 _chat_init_locks: dict[str, asyncio.Lock] = {}
 # 正在处理请求的 cookie 集合（cookie 前 32 字符为键）
 _busy_cookies: set[str] = set()
+# 全局调度锁：原子化「选 Cookie + 标记 busy」，消除并发竞态
+_dispatch_lock = asyncio.Lock()
 
 
 class _ChatNotFoundError(Exception):
@@ -287,21 +289,20 @@ async def chat_completions(request: Request):
     if not user_text:
         return JSONResponse(status_code=400, content={"error": "No user message found"})
 
-    # 验证并获取 cookies（每个 cookie 绑定独立 chat_id）
-    try:
-        cookies, bound_chat_id = get_next_with_chat()
-    except RuntimeError as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-    # P4：若选中的 cookie 正在处理请求，说明所有 cookie 均繁忙，直接拒绝
-    cookie_key = cookies[:32]
-    if cookie_key in _busy_cookies:
-        return JSONResponse(
-            status_code=429,
-            content={"error": "所有 Cookie 均繁忙，请稍后重试"},
-            headers={"Retry-After": "5"},
-        )
-    _busy_cookies.add(cookie_key)
+    # 原子化「选 Cookie + 标记 busy」：防止并发协程同时选中同一 Cookie
+    async with _dispatch_lock:
+        try:
+            cookies, bound_chat_id = get_next_with_chat()
+        except RuntimeError as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+        cookie_key = cookies[:32]
+        if cookie_key in _busy_cookies:
+            return JSONResponse(
+                status_code=429,
+                content={"error": "所有 Cookie 均繁忙，请稍后重试"},
+                headers={"Retry-After": "5"},
+            )
+        _busy_cookies.add(cookie_key)
 
     # 确保设置阶段异常时也释放 busy 标记（流式/非流式路径各自的 finally 负责正常路径）
     async def _get_chat() -> tuple[str, str | None, bool]:
