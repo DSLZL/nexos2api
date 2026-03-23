@@ -5,4 +5,5 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.9
 
 # 可选：Redis 后端（COOKIE_STORE_BACKEND=redis 时需要）
-# redis>=4.0.0
+redis>=4.0.0
+
