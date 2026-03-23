@@ -1,4 +1,5 @@
 """POST /v1/chat/completions — OpenAI 兼容接口。"""
+import asyncio
 import json
 import os
 import time
@@ -9,12 +10,15 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.chat_store import create_new_chat
-from app.config import BASE_URL
+from app.config import BASE_URL, DISABLE_HISTORY
+from app.sanitizer import sanitize_text
+from app.cookie_pool import clear_chat_id, get_chat_id, get_next_with_chat, mark_failed, mark_success, set_chat_id
+from app.request_logger import get_logger
 from app.nexos_client import (
-    _get_cookies,
     build_headers,
     build_nexos_payload,
     generate_message_id,
+    init_chat_on_server,
     make_client,
     replace_image_links,
     resolve_handler_id,
@@ -22,6 +26,14 @@ from app.nexos_client import (
 
 router = APIRouter()
 
+# per-cookie 独立锁：仅用于首次 chat_id 创建，防并发重复获取
+_chat_init_locks: dict[str, asyncio.Lock] = {}
+# 正在处理请求的 cookie 集合（cookie 前 32 字符为键）
+_busy_cookies: set[str] = set()
+
+
+class _ChatNotFoundError(Exception):
+    """Nexos 返回 404 Chat not found，需要重建 chat_id。"""
 
 def _server_host(request: Request) -> str:
     return request.headers.get("host") or f"{os.getenv('HOST', '0.0.0.0')}:{os.getenv('PORT', '3000')}"
@@ -57,14 +69,12 @@ async def _nexos_stream(
         headers=build_headers(chat_id, cookies),
         timeout=120,
     ) as resp:
-        print(f"Nexos response status: {resp.status_code}")
         if resp.status_code != 200:
-            body = await resp.aread()
-            print(f"Nexos error body: {body[:500]}")
+            await resp.aread()
+            if resp.status_code == 404:
+                raise _ChatNotFoundError()
             return
         async for chunk in resp.aiter_bytes():
-            if chunk:
-                print(f"Chunk ({len(chunk)} bytes): {chunk[:200]}")
             yield chunk
 
 
@@ -187,6 +197,7 @@ async def _stream_openai(
                 continue
 
             text = replace_image_links(text, chat_id, server_host, file_mapping)
+            text = sanitize_text(text)
 
             chunk = {
                 "id": f"chatcmpl-{generate_message_id()}",
@@ -228,6 +239,7 @@ async def _stream_openai(
                         text = event["text"]
                 if text:
                     text = replace_image_links(text, chat_id, server_host, file_mapping)
+                    text = sanitize_text(text)
                     chunk = {
                         "id": f"chatcmpl-{generate_message_id()}",
                         "object": "chat.completion.chunk",
@@ -265,9 +277,6 @@ async def chat_completions(request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
 
-    print("\n=== New chat request ===")
-    print("Messages:", json.dumps(body.get("messages", []), ensure_ascii=False))
-
     messages: list[dict] = body.get("messages", [])
     model: str = body.get("model") or "nexos-chat"
     temperature: float = body.get("temperature", 1)
@@ -277,52 +286,114 @@ async def chat_completions(request: Request):
     user_text = _extract_user_text(messages)
     if not user_text:
         return JSONResponse(status_code=400, content={"error": "No user message found"})
-    print("User message:", user_text[:200])
 
-    # 验证并获取 cookies
+    # 验证并获取 cookies（每个 cookie 绑定独立 chat_id）
     try:
-        cookies = _get_cookies()
+        cookies, bound_chat_id = get_next_with_chat()
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # 每次请求获取最新 chat_id 及 last_session_message_id（一次请求完成）
-    chat_id, last_message_id, is_real_chat = await create_new_chat(cookies)
-    print(f"Chat ID: {chat_id}, last_message_id: {last_message_id}, is_real: {is_real_chat}")
+    # P4：若选中的 cookie 正在处理请求，说明所有 cookie 均繁忙，直接拒绝
+    cookie_key = cookies[:32]
+    if cookie_key in _busy_cookies:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "所有 Cookie 均繁忙，请稍后重试"},
+            headers={"Retry-After": "5"},
+        )
+    _busy_cookies.add(cookie_key)
 
-    handler_id = await resolve_handler_id(model, cookies)
-    print(f"Requested model: {model}, handler ID: {handler_id}")
+    # 确保设置阶段异常时也释放 busy 标记（流式/非流式路径各自的 finally 负责正常路径）
+    async def _get_chat() -> tuple[str, str | None, bool]:
+        """优先复用绑定的 chat_id；否则加 per-cookie 锁创建，防并发重复获取。
+        若 DISABLE_HISTORY=true 则每次强制创建新 chat，不复用也不持久化。"""
+        if DISABLE_HISTORY:
+            cid, last_msg, is_real = await create_new_chat(cookies)
+            return cid, last_msg, is_real
+        if bound_chat_id:
+            async with make_client(timeout=30) as _c:
+                fresh_last_msg = await init_chat_on_server(_c, bound_chat_id, cookies)
+            return bound_chat_id, fresh_last_msg, True
+        # 用 cookie 前 32 字符作为锁键，防止并发请求重复创建 chat
+        lock_key = cookies[:32]
+        if lock_key not in _chat_init_locks:
+            _chat_init_locks[lock_key] = asyncio.Lock()
+        async with _chat_init_locks[lock_key]:
+            # 二次检查：可能在等锁期间已被其他协程绑定
+            already = get_chat_id(cookies)
+            if already:
+                print(f"Reusing chat_id bound during lock wait: {already}")
+                async with make_client(timeout=30) as _c:
+                    fresh_last_msg = await init_chat_on_server(_c, already, cookies)
+                return already, fresh_last_msg, True
+            cid, last_msg, is_real = await create_new_chat(cookies)
+            if cid and is_real:
+                set_chat_id(cookies, cid)
+            return cid, last_msg, is_real
+
+    async def _fresh_chat() -> tuple[str, str | None, bool]:
+        """清除过期绑定，强制获取新 chat（404 重试路径）。"""
+        clear_chat_id(cookies)
+        cid, last_msg, is_real = await create_new_chat(cookies)
+        if cid and is_real:
+            set_chat_id(cookies, cid)
+        return cid, last_msg, is_real
+
+    try:
+        chat_id, last_message_id, is_real_chat = await _get_chat()
+        handler_id = await resolve_handler_id(model, cookies)
+    except Exception:
+        _busy_cookies.discard(cookie_key)
+        raise
 
     # Gemini 模型最大 65536
     if max_tokens and "gemini" in model.lower() and max_tokens > 65536:
         max_tokens = 65536
-        print(f"Adjusted max_tokens to 65536 for Gemini model")
 
     server_host = _server_host(request)
+    _t0 = time.time()
 
-    payload = build_nexos_payload(
-        chat_id=chat_id,
-        handler_id=handler_id,
-        user_text=user_text,
-        last_message_id=last_message_id,
-        temperature=temperature,
-        max_tokens=max_tokens if body.get("max_tokens") else None,
-        is_real_chat=is_real_chat,
-    )
-    print("Nexos payload:", json.dumps(payload, ensure_ascii=False))
+    def _make_payload(cid: str, last_msg: str | None, is_real: bool) -> dict:
+        return build_nexos_payload(
+            chat_id=cid,
+            handler_id=handler_id,
+            user_text=user_text,
+            last_message_id=last_msg,
+            temperature=temperature,
+            max_tokens=max_tokens if body.get("max_tokens") else None,
+            is_real_chat=is_real,
+        )
+
 
     if stream:
-        # 流式：client 生命周期由生成器内部管理，不能用 async with 包裹
         async def _stream_with_client() -> AsyncIterator[str]:
+            _cid, _last_msg, _is_real = chat_id, last_message_id, is_real_chat
             client = make_client(timeout=120)
+            _failed = False
             try:
-                async for chunk in _stream_openai(
-                    _nexos_stream(client, chat_id, payload, cookies),
-                    model,
-                    chat_id,
-                    server_host,
-                ):
-                    yield chunk
+                try:
+                    async for chunk in _stream_openai(
+                        _nexos_stream(client, _cid, _make_payload(_cid, _last_msg, _is_real), cookies),
+                        model, _cid, server_host,
+                    ):
+                        yield chunk
+                except _ChatNotFoundError:
+                    _cid, _last_msg, _is_real = await _fresh_chat()
+                    async for chunk in _stream_openai(
+                        _nexos_stream(client, _cid, _make_payload(_cid, _last_msg, _is_real), cookies),
+                        model, _cid, server_host,
+                    ):
+                        yield chunk
+            except Exception as _exc:
+                _failed = True
+                mark_failed(cookies)
+                get_logger().record(cookies, model, False, int((time.time() - _t0) * 1000), str(_exc))
+                raise
             finally:
+                if not _failed:
+                    mark_success(cookies)
+                    get_logger().record(cookies, model, True, int((time.time() - _t0) * 1000))
+                _busy_cookies.discard(cookie_key)
                 await client.aclose()
 
         return StreamingResponse(
@@ -334,10 +405,26 @@ async def chat_completions(request: Request):
             },
         )
 
-    # 非流式：正常 async with 即可
-    async with make_client(timeout=120) as client:
-        raw = await _collect_response(client, chat_id, payload, cookies)
-    print(f"Response size: {len(raw)} bytes")
+    # 非流式
+    _failed = False
+    try:
+        try:
+            async with make_client(timeout=120) as client:
+                raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
+        except _ChatNotFoundError:
+            chat_id, last_message_id, is_real_chat = await _fresh_chat()
+            async with make_client(timeout=120) as client:
+                raw = await _collect_response(client, chat_id, _make_payload(chat_id, last_message_id, is_real_chat), cookies)
+    except Exception as _exc:
+        _failed = True
+        mark_failed(cookies)
+        get_logger().record(cookies, model, False, int((time.time() - _t0) * 1000), str(_exc))
+        raise
+    finally:
+        if not _failed:
+            mark_success(cookies)
+            get_logger().record(cookies, model, True, int((time.time() - _t0) * 1000))
+        _busy_cookies.discard(cookie_key)
 
     events = _parse_sse_events(raw)
     text, file_mapping = _extract_text_and_files(events)

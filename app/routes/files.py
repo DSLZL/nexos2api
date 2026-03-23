@@ -3,7 +3,8 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
-from app.nexos_client import _get_cookies, download_file, make_client
+from app.cookie_pool import get_next as _get_cookies
+from app.nexos_client import download_file, make_client
 
 router = APIRouter()
 

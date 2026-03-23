@@ -12,7 +12,8 @@ _CACHE_TTL = 600  # 10 分钟
 
 # 按 cookie 独立缓存：cookie_key -> (cached_at, mapping, models_list)
 _cache: dict[str, tuple[float, dict[str, str], list[dict]]] = {}
-_cache_lock = asyncio.Lock()
+# per-cookie 独立锁：不同 cookie 的缓存刷新完全并行
+_locks: dict[str, asyncio.Lock] = {}
 
 
 def _normalize(name: str) -> str:
@@ -23,6 +24,28 @@ def _normalize(name: str) -> str:
 def _cookie_key(cookies: str) -> str:
     """取 cookie 字符串前 32 个字符作为缓存键（避免完整 cookie 占内存）。"""
     return cookies[:32]
+
+
+def _infer_owned_by(name: str) -> str:
+    """根据模型名称推断 owned_by 字段。"""
+    n = name.lower()
+    if any(k in n for k in ("claude", "anthropic")):
+        return "anthropic"
+    if any(k in n for k in ("gpt", "o1", "o3", "o4", "chatgpt", "dall-e", "whisper", "tts")):
+        return "openai"
+    if any(k in n for k in ("gemini", "palm", "bard")):
+        return "google"
+    if any(k in n for k in ("grok",)):
+        return "xai"
+    if any(k in n for k in ("llama", "meta")):
+        return "meta"
+    if any(k in n for k in ("mistral", "mixtral")):
+        return "mistralai"
+    if any(k in n for k in ("deepseek",)):
+        return "deepseek"
+    if any(k in n for k in ("qwen", "tongyi")):
+        return "alibaba"
+    return "openai"
 
 
 async def _fetch_models(cookies: str) -> tuple[dict[str, str], list[dict]]:
@@ -61,7 +84,7 @@ async def _fetch_models(cookies: str) -> tuple[dict[str, str], list[dict]]:
             "id": normalized,
             "object": "model",
             "created": now,
-            "owned_by": "nexos",
+            "owned_by": _infer_owned_by(custom_name),
             "name": custom_name,
         })
 
@@ -71,7 +94,10 @@ async def _fetch_models(cookies: str) -> tuple[dict[str, str], list[dict]]:
 async def get_model_mapping(cookies: str) -> dict[str, str]:
     """返回该 cookie 对应的缓存 mapping，过期则自动刷新。"""
     key = _cookie_key(cookies)
-    async with _cache_lock:
+    # 获取或创建该 cookie 的独立锁，不同 cookie 的刷新完全并行
+    if key not in _locks:
+        _locks[key] = asyncio.Lock()
+    async with _locks[key]:
         cached_at, mapping, _ = _cache.get(key, (0.0, {}, []))
         if time.time() - cached_at > _CACHE_TTL:
             try:
@@ -101,3 +127,11 @@ async def get_handler_id(model: str, cookies: str) -> str:
         print(f"Warning: model '{model}' not found in registry, using DEFAULT_HANDLER_ID")
         return DEFAULT_HANDLER_ID
     return result
+
+
+def get_cached_model_count() -> int:
+    """从缓存同步读取任意一个 cookie 的模型数量（仅用于统计展示）。"""
+    if not _cache:
+        return 0
+    _, _, models = next(iter(_cache.values()))
+    return len(models)
